@@ -1,20 +1,788 @@
-import 'dotenv/config'; import express from 'express'; import cors from 'cors'; import cookieParser from 'cookie-parser'; import {createServer} from 'node:http'; import {z} from 'zod'; import {Role,TaskStatus,Priority,Prisma} from '@prisma/client'; import {prisma} from './lib/prisma.js'; import {checkPassword,issueRefresh,rotateRefresh,signAccess} from './auth.js'; import {auth,roles} from './middleware/auth.js'; import {errors} from './middleware/errors.js'; import {initSocket,getIO} from './lib/socket.js'; import {startOverdueJob} from './jobs/overdue.js';
-const app=express();app.use(cors({origin:process.env.CLIENT_URL,credentials:true}));app.use(express.json());app.use(cookieParser());
-const cookieOpts={httpOnly:true,sameSite:'lax' as const,secure:process.env.NODE_ENV==='production',path:'/api/auth'};
-const publicUser=(u:any)=>({id:u.id,name:u.name,email:u.email,role:u.role});
-app.get('/api/health',(_,r)=>r.json({ok:true}));
-app.post('/api/auth/login',async(req,res,next)=>{try{const d=z.object({email:z.string().email(),password:z.string().min(6)}).parse(req.body);const u=await prisma.user.findUnique({where:{email:d.email}});if(!u||!(await checkPassword(d.password,u.passwordHash)))return res.status(401).json({error:{code:'INVALID_CREDENTIALS',message:'Invalid email or password'}});const access=signAccess({id:u.id,role:u.role,name:u.name});const refresh=await issueRefresh(u.id);res.cookie('refreshToken',refresh,{...cookieOpts,maxAge:7*864e5});res.json({accessToken:access,user:publicUser(u)})}catch(e){next(e)}});
-app.post('/api/auth/refresh',async(req,res)=>{const raw=req.cookies.refreshToken; if(!raw)return res.status(401).json({error:{code:'UNAUTHORIZED',message:'Refresh token missing'}});const x=await rotateRefresh(raw);if(!x)return res.status(401).json({error:{code:'UNAUTHORIZED',message:'Refresh token invalid'}});res.cookie('refreshToken',x.refresh,{...cookieOpts,maxAge:7*864e5});res.json({accessToken:signAccess({id:x.user.id,role:x.user.role,name:x.user.name}),user:publicUser(x.user)})});
-app.post('/api/auth/logout',async(req,res)=>{res.clearCookie('refreshToken',cookieOpts);res.json({ok:true})});
-app.get('/api/me',auth,async(req,res)=>res.json({user:await prisma.user.findUnique({where:{id:req.user!.id},select:{id:true,name:true,email:true,role:true}})}));
-app.get('/api/projects',auth,async(req,res)=>{const u=req.user!;const where:any=u.role===Role.ADMIN?{}:{creatorId:u.id};const projects=await prisma.project.findMany({where,include:{client:true,_count:{select:{tasks:true}}},orderBy:{createdAt:'desc'}});res.json({projects})});
-app.post('/api/projects',auth,roles(Role.ADMIN,Role.PM),async(req,res,next)=>{try{const d=z.object({name:z.string().min(2),description:z.string().optional(),clientId:z.string()}).parse(req.body);const p=await prisma.project.create({data:{...d,creatorId:req.user!.id}});res.status(201).json({project:p})}catch(e){next(e)}});
-app.get('/api/clients',auth,async(_,res)=>res.json({clients:await prisma.client.findMany({orderBy:{name:'asc'}})}));
-app.get('/api/tasks',auth,async(req,res,next)=>{try{const u=req.user!;const q=z.object({projectId:z.string().optional(),status:z.nativeEnum(TaskStatus).optional(),priority:z.nativeEnum(Priority).optional(),from:z.coerce.date().optional(),to:z.coerce.date().optional()}).parse(req.query);let where:any={status:q.status,priority:q.priority,dueDate:q.from||q.to?{...(q.from&&{gte:q.from}),...(q.to&&{lte:q.to})}:undefined};if(u.role===Role.DEVELOPER)where.developerId=u.id;else if(u.role===Role.PM)where.project={creatorId:u.id};if(q.projectId)where.projectId=q.projectId;const tasks=await prisma.task.findMany({where,include:{project:true,developer:{select:{id:true,name:true,email:true}}},orderBy:[{priority:'desc'},{dueDate:'asc'}]});res.json({tasks})}catch(e){next(e)}});
-app.patch('/api/tasks/:id/status',auth,async(req,res,next)=>{try{const d=z.object({status:z.nativeEnum(TaskStatus).refine(s=>s!==TaskStatus.OVERDUE)}).parse(req.body);const u=req.user!;const task=await prisma.task.findUnique({where:{id:req.params.id},include:{project:true,developer:true}});if(!task)return res.status(404).json({error:{code:'NOT_FOUND',message:'Task not found'}});if(u.role===Role.DEVELOPER&&task.developerId!==u.id)return res.status(403).json({error:{code:'FORBIDDEN',message:'This task is not assigned to you'}});if(u.role===Role.PM&&task.project.creatorId!==u.id)return res.status(403).json({error:{code:'FORBIDDEN',message:'This project is not yours'}});const message=`${u.name} moved ${task.title} from ${task.status} → ${d.status}`;const [updated,activity]=await prisma.$transaction([prisma.task.update({where:{id:task.id},data:{status:d.status}}),prisma.activityLog.create({data:{message,userId:u.id,projectId:task.projectId,taskId:task.id,fromStatus:task.status,toStatus:d.status}})]);if(d.status===TaskStatus.IN_REVIEW&&task.developerId!==u.id){await prisma.notification.create({data:{userId:task.project.creatorId,taskId:task.id,message:`${u.name} moved ${task.title} to In Review`}});getIO()?.to(`user:${task.project.creatorId}`).emit('notification:new',{message})}getIO()?.to(`project:${task.projectId}`).emit('activity:new',{...activity,user:u.name});getIO()?.to(`project:${task.projectId}`).emit('task:updated',{taskId:task.id,status:updated.status});res.json({task:updated})}catch(e){next(e)}});
-app.post('/api/tasks',auth,roles(Role.ADMIN,Role.PM),async(req,res,next)=>{try{const d=z.object({title:z.string().min(2),description:z.string().optional(),projectId:z.string(),developerId:z.string(),priority:z.nativeEnum(Priority),dueDate:z.coerce.date()}).parse(req.body);const p=await prisma.project.findUnique({where:{id:d.projectId}});if(!p|| (req.user!.role===Role.PM&&p.creatorId!==req.user!.id))return res.status(403).json({error:{code:'FORBIDDEN',message:'Cannot add tasks to this project'}});const t=await prisma.task.create({data:d});await prisma.notification.create({data:{userId:d.developerId,taskId:t.id,message:`You were assigned ${t.title}`}});getIO()?.to(`user:${d.developerId}`).emit('notification:new',{message:`You were assigned ${t.title}`});res.status(201).json({task:t})}catch(e){next(e)}});
-app.get('/api/activity',auth,async(req,res,next)=>{try{const u=req.user!;const projectId=String(req.query.projectId||'');let where:any={};if(u.role===Role.ADMIN)where=projectId?{projectId}:{};else if(u.role===Role.PM)where=projectId?{projectId,project:{creatorId:u.id}}:{project:{creatorId:u.id}};else where=projectId?{projectId,task:{developerId:u.id}}:{task:{developerId:u.id}};const events=await prisma.activityLog.findMany({where,include:{user:{select:{name:true}},task:{select:{title:true}}},orderBy:{createdAt:'desc'},take:20});res.json({events})}catch(e){next(e)}});
-app.get('/api/notifications',auth,async(req,res)=>res.json({notifications:await prisma.notification.findMany({where:{userId:req.user!.id},orderBy:{createdAt:'desc'},take:30})}));
-app.patch('/api/notifications/:id/read',auth,async(req,res)=>{await prisma.notification.updateMany({where:{id:req.params.id,userId:req.user!.id},data:{read:true,readAt:new Date()}});res.json({ok:true})});app.post('/api/notifications/read-all',auth,async(req,res)=>{await prisma.notification.updateMany({where:{userId:req.user!.id,read:false},data:{read:true,readAt:new Date()}});res.json({ok:true})});
-app.get('/api/dashboard',auth,async(req,res)=>{const u=req.user!;const projectWhere:any=u.role===Role.ADMIN?{}:{creatorId:u.id};const taskWhere:any=u.role===Role.DEVELOPER?{developerId:u.id}:u.role===Role.PM?{project:{creatorId:u.id}}:{};const [projects,total,byStatus,overdue,unread]=await Promise.all([prisma.project.count({where:projectWhere}),prisma.task.count({where:taskWhere}),prisma.task.groupBy({by:['status'],where:taskWhere,_count:{_all:true}}),prisma.task.count({where:{...taskWhere,status:TaskStatus.OVERDUE}}),prisma.notification.count({where:{userId:u.id,read:false}})]);res.json({projects,tasks:total,byStatus,overdue,unread})});
-app.use(errors);const server=createServer(app);initSocket(server);startOverdueJob();server.listen(Number(process.env.PORT||4000),()=>console.log(`API listening on ${process.env.PORT||4000}`));
+import 'dotenv/config';
+import express from 'express';
+import cors from 'cors';
+import cookieParser from 'cookie-parser';
+import { createServer } from 'node:http';
+import { z } from 'zod';
+import { Role, TaskStatus, Priority } from '@prisma/client';
+
+import { prisma } from './lib/prisma.js';
+import {
+  checkPassword,
+  issueRefresh,
+  rotateRefresh,
+  signAccess,
+} from './auth.js';
+import { auth, roles } from './middleware/auth.js';
+import { errors } from './middleware/errors.js';
+import { initSocket, getIO } from './lib/socket.js';
+import { startOverdueJob } from './jobs/overdue.js';
+
+const app = express();
+
+app.use(
+  cors({
+    origin: process.env.CLIENT_URL,
+    credentials: true,
+  })
+);
+
+app.use(express.json());
+app.use(cookieParser());
+
+const cookieOpts = {
+  httpOnly: true,
+  sameSite: 'lax' as const,
+  secure: process.env.NODE_ENV === 'production',
+  path: '/api/auth',
+};
+
+const publicUser = (u: any) => ({
+  id: u.id,
+  name: u.name,
+  email: u.email,
+  role: u.role,
+});
+
+/* --------------------------------------------------
+   HEALTH
+-------------------------------------------------- */
+
+app.get('/api/health', (_, res) => {
+  res.json({ ok: true });
+});
+
+/* --------------------------------------------------
+   AUTH
+-------------------------------------------------- */
+
+app.post('/api/auth/login', async (req, res, next) => {
+  try {
+    const d = z
+      .object({
+        email: z.string().email(),
+        password: z.string().min(6),
+      })
+      .parse(req.body);
+
+    const u = await prisma.user.findUnique({
+      where: {
+        email: d.email,
+      },
+    });
+
+    if (
+      !u ||
+      !(await checkPassword(d.password, u.passwordHash))
+    ) {
+      return res.status(401).json({
+        error: {
+          code: 'INVALID_CREDENTIALS',
+          message: 'Invalid email or password',
+        },
+      });
+    }
+
+    const access = signAccess({
+      id: u.id,
+      role: u.role,
+      name: u.name,
+    });
+
+    const refresh = await issueRefresh(u.id);
+
+    res.cookie('refreshToken', refresh, {
+      ...cookieOpts,
+      maxAge: 7 * 864e5,
+    });
+
+    res.json({
+      accessToken: access,
+      user: publicUser(u),
+    });
+  } catch (e) {
+    next(e);
+  }
+});
+
+app.post('/api/auth/refresh', async (req, res) => {
+  const raw = req.cookies.refreshToken;
+
+  if (!raw) {
+    return res.status(401).json({
+      error: {
+        code: 'UNAUTHORIZED',
+        message: 'Refresh token missing',
+      },
+    });
+  }
+
+  const x = await rotateRefresh(raw);
+
+  if (!x) {
+    return res.status(401).json({
+      error: {
+        code: 'UNAUTHORIZED',
+        message: 'Refresh token invalid',
+      },
+    });
+  }
+
+  res.cookie('refreshToken', x.refresh, {
+    ...cookieOpts,
+    maxAge: 7 * 864e5,
+  });
+
+  res.json({
+    accessToken: signAccess({
+      id: x.user.id,
+      role: x.user.role,
+      name: x.user.name,
+    }),
+    user: publicUser(x.user),
+  });
+});
+
+app.post('/api/auth/logout', async (req, res) => {
+  res.clearCookie('refreshToken', cookieOpts);
+  res.json({ ok: true });
+});
+
+/* --------------------------------------------------
+   CURRENT USER
+-------------------------------------------------- */
+
+app.get('/api/me', auth, async (req, res) => {
+  res.json({
+    user: await prisma.user.findUnique({
+      where: {
+        id: req.user!.id,
+      },
+      select: {
+        id: true,
+        name: true,
+        email: true,
+        role: true,
+      },
+    }),
+  });
+});
+
+/* --------------------------------------------------
+   PROJECTS
+-------------------------------------------------- */
+
+app.get('/api/projects', auth, async (req, res) => {
+  const u = req.user!;
+
+  const where: any =
+    u.role === Role.ADMIN
+      ? {}
+      : {
+          creatorId: u.id,
+        };
+
+  const projects = await prisma.project.findMany({
+    where,
+    include: {
+      client: true,
+      _count: {
+        select: {
+          tasks: true,
+        },
+      },
+    },
+    orderBy: {
+      createdAt: 'desc',
+    },
+  });
+
+  res.json({ projects });
+});
+
+app.post(
+  '/api/projects',
+  auth,
+  roles(Role.ADMIN, Role.PM),
+  async (req, res, next) => {
+    try {
+      const d = z
+        .object({
+          name: z.string().min(2),
+          description: z.string().optional(),
+          clientId: z.string(),
+        })
+        .parse(req.body);
+
+      const p = await prisma.project.create({
+        data: {
+          ...d,
+          creatorId: req.user!.id,
+        },
+      });
+
+      res.status(201).json({
+        project: p,
+      });
+    } catch (e) {
+      next(e);
+    }
+  }
+);
+
+/* --------------------------------------------------
+   CLIENTS
+-------------------------------------------------- */
+
+app.get('/api/clients', auth, async (_, res) => {
+  res.json({
+    clients: await prisma.client.findMany({
+      orderBy: {
+        name: 'asc',
+      },
+    }),
+  });
+});
+
+/* --------------------------------------------------
+   TASKS - GET
+-------------------------------------------------- */
+
+app.get('/api/tasks', auth, async (req, res, next) => {
+  try {
+    const u = req.user!;
+
+    const q = z
+      .object({
+        projectId: z.string().optional(),
+        status: z.nativeEnum(TaskStatus).optional(),
+        priority: z.nativeEnum(Priority).optional(),
+        from: z.coerce.date().optional(),
+        to: z.coerce.date().optional(),
+      })
+      .parse(req.query);
+
+    let where: any = {
+      status: q.status,
+      priority: q.priority,
+      dueDate:
+        q.from || q.to
+          ? {
+              ...(q.from && {
+                gte: q.from,
+              }),
+              ...(q.to && {
+                lte: q.to,
+              }),
+            }
+          : undefined,
+    };
+
+    if (u.role === Role.DEVELOPER) {
+      where.developerId = u.id;
+    } else if (u.role === Role.PM) {
+      where.project = {
+        creatorId: u.id,
+      };
+    }
+
+    if (q.projectId) {
+      where.projectId = q.projectId;
+    }
+
+    const tasks = await prisma.task.findMany({
+      where,
+      include: {
+        project: true,
+        developer: {
+          select: {
+            id: true,
+            name: true,
+            email: true,
+          },
+        },
+      },
+      orderBy: [
+        {
+          priority: 'desc',
+        },
+        {
+          dueDate: 'asc',
+        },
+      ],
+    });
+
+    res.json({ tasks });
+  } catch (e) {
+    next(e);
+  }
+});
+
+/* --------------------------------------------------
+   TASK STATUS UPDATE
+-------------------------------------------------- */
+
+app.patch(
+  '/api/tasks/:id/status',
+  auth,
+  async (req, res, next) => {
+    try {
+      const d = z
+        .object({
+          status: z
+            .nativeEnum(TaskStatus)
+            .refine(
+              (s) => s !== TaskStatus.OVERDUE
+            ),
+        })
+        .parse(req.body);
+
+      const u = req.user!;
+
+      // Express 5 types can expose params as string | string[]
+      // Convert explicitly to string.
+      const taskId = String(req.params.id);
+
+      const task = await prisma.task.findUnique({
+        where: {
+          id: taskId,
+        },
+        include: {
+          developer: true,
+        },
+      });
+
+      if (!task) {
+        return res.status(404).json({
+          error: {
+            code: 'NOT_FOUND',
+            message: 'Task not found',
+          },
+        });
+      }
+
+      // Fetch project separately instead of using task.project.
+      // This avoids Prisma's generated type issue.
+      const project = await prisma.project.findUnique({
+        where: {
+          id: task.projectId,
+        },
+      });
+
+      if (!project) {
+        return res.status(404).json({
+          error: {
+            code: 'NOT_FOUND',
+            message: 'Project not found',
+          },
+        });
+      }
+
+      if (
+        u.role === Role.DEVELOPER &&
+        task.developerId !== u.id
+      ) {
+        return res.status(403).json({
+          error: {
+            code: 'FORBIDDEN',
+            message:
+              'This task is not assigned to you',
+          },
+        });
+      }
+
+      if (
+        u.role === Role.PM &&
+        project.creatorId !== u.id
+      ) {
+        return res.status(403).json({
+          error: {
+            code: 'FORBIDDEN',
+            message: 'This project is not yours',
+          },
+        });
+      }
+
+      const message = `${u.name} moved ${task.title} from ${task.status} → ${d.status}`;
+
+      const [updated, activity] =
+        await prisma.$transaction([
+          prisma.task.update({
+            where: {
+              id: task.id,
+            },
+            data: {
+              status: d.status,
+            },
+          }),
+
+          prisma.activityLog.create({
+            data: {
+              message,
+              userId: u.id,
+              projectId: task.projectId,
+              taskId: task.id,
+              fromStatus: task.status,
+              toStatus: d.status,
+            },
+          }),
+        ]);
+
+      if (
+        d.status === TaskStatus.IN_REVIEW &&
+        task.developerId !== u.id
+      ) {
+        await prisma.notification.create({
+          data: {
+            userId: project.creatorId,
+            taskId: task.id,
+            message: `${u.name} moved ${task.title} to In Review`,
+          },
+        });
+
+        getIO()
+          ?.to(`user:${project.creatorId}`)
+          .emit('notification:new', {
+            message,
+          });
+      }
+
+      getIO()
+        ?.to(`project:${task.projectId}`)
+        .emit('activity:new', {
+          ...activity,
+          user: u.name,
+        });
+
+      getIO()
+        ?.to(`project:${task.projectId}`)
+        .emit('task:updated', {
+          taskId: task.id,
+          status: updated.status,
+        });
+
+      res.json({
+        task: updated,
+      });
+    } catch (e) {
+      next(e);
+    }
+  }
+);
+
+/* --------------------------------------------------
+   CREATE TASK
+-------------------------------------------------- */
+
+app.post(
+  '/api/tasks',
+  auth,
+  roles(Role.ADMIN, Role.PM),
+  async (req, res, next) => {
+    try {
+      const d = z
+        .object({
+          title: z.string().min(2),
+          description: z.string().optional(),
+          projectId: z.string(),
+          developerId: z.string(),
+          priority: z.nativeEnum(Priority),
+          dueDate: z.coerce.date(),
+        })
+        .parse(req.body);
+
+      const p = await prisma.project.findUnique({
+        where: {
+          id: d.projectId,
+        },
+      });
+
+      if (
+        !p ||
+        (req.user!.role === Role.PM &&
+          p.creatorId !== req.user!.id)
+      ) {
+        return res.status(403).json({
+          error: {
+            code: 'FORBIDDEN',
+            message:
+              'Cannot add tasks to this project',
+          },
+        });
+      }
+
+      const t = await prisma.task.create({
+        data: d,
+      });
+
+      await prisma.notification.create({
+        data: {
+          userId: d.developerId,
+          taskId: t.id,
+          message: `You were assigned ${t.title}`,
+        },
+      });
+
+      getIO()
+        ?.to(`user:${d.developerId}`)
+        .emit('notification:new', {
+          message: `You were assigned ${t.title}`,
+        });
+
+      res.status(201).json({
+        task: t,
+      });
+    } catch (e) {
+      next(e);
+    }
+  }
+);
+
+/* --------------------------------------------------
+   ACTIVITY
+-------------------------------------------------- */
+
+app.get(
+  '/api/activity',
+  auth,
+  async (req, res, next) => {
+    try {
+      const u = req.user!;
+
+      const projectId = String(
+        req.query.projectId || ''
+      );
+
+      let where: any = {};
+
+      if (u.role === Role.ADMIN) {
+        where = projectId
+          ? {
+              projectId,
+            }
+          : {};
+      } else if (u.role === Role.PM) {
+        where = projectId
+          ? {
+              projectId,
+              project: {
+                creatorId: u.id,
+              },
+            }
+          : {
+              project: {
+                creatorId: u.id,
+              },
+            };
+      } else {
+        where = projectId
+          ? {
+              projectId,
+              task: {
+                developerId: u.id,
+              },
+            }
+          : {
+              task: {
+                developerId: u.id,
+              },
+            };
+      }
+
+      const events =
+        await prisma.activityLog.findMany({
+          where,
+          include: {
+            user: {
+              select: {
+                name: true,
+              },
+            },
+            task: {
+              select: {
+                title: true,
+              },
+            },
+          },
+          orderBy: {
+            createdAt: 'desc',
+          },
+          take: 20,
+        });
+
+      res.json({
+        events,
+      });
+    } catch (e) {
+      next(e);
+    }
+  }
+);
+
+/* --------------------------------------------------
+   NOTIFICATIONS
+-------------------------------------------------- */
+
+app.get(
+  '/api/notifications',
+  auth,
+  async (req, res) => {
+    res.json({
+      notifications:
+        await prisma.notification.findMany({
+          where: {
+            userId: req.user!.id,
+          },
+          orderBy: {
+            createdAt: 'desc',
+          },
+          take: 30,
+        }),
+    });
+  }
+);
+
+app.patch(
+  '/api/notifications/:id/read',
+  auth,
+  async (req, res) => {
+    await prisma.notification.updateMany({
+      where: {
+        id: String(req.params.id),
+        userId: req.user!.id,
+      },
+      data: {
+        read: true,
+        readAt: new Date(),
+      },
+    });
+
+    res.json({
+      ok: true,
+    });
+  }
+);
+
+app.post(
+  '/api/notifications/read-all',
+  auth,
+  async (req, res) => {
+    await prisma.notification.updateMany({
+      where: {
+        userId: req.user!.id,
+        read: false,
+      },
+      data: {
+        read: true,
+        readAt: new Date(),
+      },
+    });
+
+    res.json({
+      ok: true,
+    });
+  }
+);
+
+/* --------------------------------------------------
+   DASHBOARD
+-------------------------------------------------- */
+
+app.get(
+  '/api/dashboard',
+  auth,
+  async (req, res) => {
+    const u = req.user!;
+
+    const projectWhere: any =
+      u.role === Role.ADMIN
+        ? {}
+        : {
+            creatorId: u.id,
+          };
+
+    const taskWhere: any =
+      u.role === Role.DEVELOPER
+        ? {
+            developerId: u.id,
+          }
+        : u.role === Role.PM
+        ? {
+            project: {
+              creatorId: u.id,
+            },
+          }
+        : {};
+
+    const [
+      projects,
+      total,
+      byStatus,
+      overdue,
+      unread,
+    ] = await Promise.all([
+      prisma.project.count({
+        where: projectWhere,
+      }),
+
+      prisma.task.count({
+        where: taskWhere,
+      }),
+
+      prisma.task.groupBy({
+        by: ['status'],
+        where: taskWhere,
+        _count: {
+          _all: true,
+        },
+      }),
+
+      prisma.task.count({
+        where: {
+          ...taskWhere,
+          status: TaskStatus.OVERDUE,
+        },
+      }),
+
+      prisma.notification.count({
+        where: {
+          userId: u.id,
+          read: false,
+        },
+      }),
+    ]);
+
+    res.json({
+      projects,
+      tasks: total,
+      byStatus,
+      overdue,
+      unread,
+    });
+  }
+);
+
+/* --------------------------------------------------
+   ERROR HANDLER
+-------------------------------------------------- */
+
+app.use(errors);
+
+/* --------------------------------------------------
+   HTTP + SOCKET.IO SERVER
+-------------------------------------------------- */
+
+const server = createServer(app);
+
+initSocket(server);
+
+startOverdueJob();
+
+server.listen(
+  Number(process.env.PORT || 4000),
+  () => {
+    console.log(
+      `API listening on ${process.env.PORT || 4000}`
+    );
+  }
+);
