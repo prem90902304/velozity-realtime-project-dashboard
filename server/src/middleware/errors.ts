@@ -1,0 +1,2 @@
+import {Request,Response,NextFunction} from 'express'; import {ZodError} from 'zod';
+export function errors(err:any,_req:Request,res:Response,_next:NextFunction){if(err instanceof ZodError)return res.status(400).json({error:{code:'VALIDATION_ERROR',message:'Invalid request',details:err.issues}}); console.error(err);res.status(err.status||500).json({error:{code:err.code||'INTERNAL_ERROR',message:err.message||'Internal server error'}})}
