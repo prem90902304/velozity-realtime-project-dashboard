@@ -192,7 +192,7 @@ https://velozity-realtime-dashboard-api-8m9q.onrender.com
 - Socket presence is process-local; a multi-instance deployment should use a Socket.IO Redis adapter for cross-instance presence/events.
 - Refresh-token cleanup can be moved to a scheduled maintenance job for very large installations.
 
-## 150–250 Word Explanation
+## Explanation
 
 The hardest problem was keeping the real-time activity feed both live and correctly scoped by role. I treated PostgreSQL as the source of truth instead of relying on a socket-side cache. Every task status change is performed through an authenticated API request and written in a transaction together with an ActivityLog row. Only after the database write succeeds is a Socket.IO event emitted to the relevant project room. Socket connections are authenticated with the same JWT claims used by the API, and room membership is checked against the database so a developer cannot subscribe to an unrelated project. API queries apply the same ownership rules independently, which means changing a token or calling an endpoint directly does not bypass authorization.
 
